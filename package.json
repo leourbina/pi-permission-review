@@ -1,0 +1,52 @@
+{
+  "name": "pi-permission-review",
+  "version": "1.0.0",
+  "description": "Review recently denied tool calls in pi, allow one, remember it, or write a real policy rule — then retry the call.",
+  "license": "MIT",
+  "author": "Leonardo Urbina",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "permissions",
+    "review",
+    "denied",
+    "guardrails"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "approvals.ts",
+    "denials.ts",
+    "panel.ts",
+    "policy.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@gotgenes/pi-permission-system": ">=42.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@gotgenes/pi-permission-system": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leourbina/pi-permission-review.git"
+  },
+  "homepage": "https://github.com/leourbina/pi-permission-review#readme",
+  "bugs": {
+    "url": "https://github.com/leourbina/pi-permission-review/issues"
+  }
+}

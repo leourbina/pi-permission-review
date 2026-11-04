@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+*.bak.*
+approvals.json
+denials.json
+pending-retry.json
+.DS_Store
