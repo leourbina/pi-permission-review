@@ -282,8 +282,6 @@ export default function permissionReview(pi: ExtensionAPI): void {
 				send(command, retryMessage(pending.toolName, pending.value));
 			}, 400);
 		}
-
-		if (event.reason === "reload") registered = false;
 	});
 	pi.on("session_shutdown", () => {
 		session.clear();
