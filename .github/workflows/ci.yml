@@ -21,5 +21,8 @@ jobs:
       - name: Check the manifest and entry points
         run: node scripts/check-manifest.mjs
 
+      - name: Unit tests
+        run: npm test
+
       - name: Verify the published tarball
         run: npm pack --dry-run

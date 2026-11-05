@@ -41,11 +41,16 @@ for (const forbidden of ["approvals.json", "denials.json", "pending-retry.json"]
 	if (pkg.files.includes(forbidden)) fail(`files must not include state: ${forbidden}`);
 }
 
-// Every module imported by index.ts has to be in the tarball.
-const entry = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
-const local = [...entry.matchAll(/from "\.\/([^"]+)"/g)].map((match) => match[1]);
-for (const module of local) {
-	if (!pkg.files.includes(module)) fail(`index.ts imports ./${module}, which files does not list`);
+// Every module reachable from index.ts has to be in the tarball.
+const seen = new Set();
+const queue = ["index.ts"];
+while (queue.length > 0) {
+	const module = queue.shift();
+	if (seen.has(module)) continue;
+	seen.add(module);
+	if (!pkg.files.includes(module)) fail(`./${module} is imported but files does not list it`);
+	const source = readFileSync(new URL(`../${module}`, import.meta.url), "utf8");
+	for (const match of source.matchAll(/from "\.\/([^"]+)"/g)) queue.push(match[1]);
 }
 
 console.log(`check-manifest: ok — ${pkg.name}@${pkg.version}, ${pkg.files.length} files, entry ${extensions.join(", ")}`);

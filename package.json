@@ -25,11 +25,16 @@
     "approvals.ts",
     "denials.ts",
     "panel.ts",
+    "pattern.ts",
     "policy.ts",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --experimental-strip-types --no-warnings --test test/*.test.ts",
+    "check": "node scripts/check-manifest.mjs"
+  },
   "engines": {
     "node": ">=22"
   },

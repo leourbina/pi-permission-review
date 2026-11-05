@@ -8,7 +8,7 @@
  */
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { Input, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 import {
 	type ApprovalEntry,
@@ -16,14 +16,18 @@ import {
 	type Approvals,
 	countMatches,
 	SessionApprovals,
-	entryMatches,
 } from "./approvals.ts";
-import { type Denial, isLinkExcludedSurface, timeLabel } from "./denials.ts";
-import { policyKeyForSurface, sanitisePattern, suggestPattern } from "./policy.ts";
+import { type Denial, timeLabel } from "./denials.ts";
+import { checkPatternShape, policyKeyForSurface, sanitisePattern, suggestPattern } from "./policy.ts";
 
 export type PanelResult =
-	| { kind: "approve"; denial: Denial; remember: boolean }
+	/** Approve this exact call for the rest of the session. */
+	| { kind: "approve"; denial: Denial }
+	/** Remember an exact call or a pattern in approvals.json. */
+	| { kind: "remember"; denial: Denial; pattern: string }
+	/** Write an allow rule into the policy config. */
 	| { kind: "write-rule"; denial: Denial; pattern: string }
+	| { kind: "edit"; entry: ApprovalEntry; listKind: ApprovalKind; pattern: string }
 	| { kind: "delete"; entry: ApprovalEntry; listKind: ApprovalKind }
 	| undefined;
 
@@ -33,6 +37,18 @@ export type PanelData = {
 	session: SessionApprovals;
 	/** Short description of the active reviewer, shown top-right. */
 	judge: string;
+	/** Warnings to confirm before a policy rule is written (deny overlaps, …). */
+	ruleConflicts: (denial: Denial, pattern: string) => string[];
+};
+
+type EditorMode = "remember" | "rule" | "edit";
+
+type EditorState = {
+	mode: EditorMode;
+	denial?: Denial;
+	row?: RememberedRow;
+	/** The pattern whose warnings were already shown; a second enter writes it. */
+	confirmed?: string;
 };
 
 type Tab = "denied" | "remembered" | "session";
@@ -63,7 +79,6 @@ const GLYPH = {
 	marker: "▶",
 	active: "⟦",
 	activeEnd: "⟧",
-	cursor: "▏",
 };
 
 function plainTruncate(text: string, width: number): string {
@@ -85,8 +100,9 @@ export async function openPanel(
 			let tab: Tab = "denied";
 			let cursor = 0;
 			let expanded = false;
-			let editing = false;
-			let editorValue = "";
+			let editor: EditorState | undefined;
+			const input = new Input({ prompt: "" });
+			input.focused = true;
 			let hint = "";
 			let cachedWidth: number | undefined;
 			let cachedLines: string[] | undefined;
@@ -149,65 +165,81 @@ export async function openPanel(
 				tui.requestRender();
 			};
 
-			const approve = (remember: boolean): void => {
+			const approve = (): void => {
 				const denial = selectedDenial();
 				if (!denial) return;
 				if (!denial.overridable) {
 					denyUnavailable("an authorizer cannot lift a rule — write one instead (w)");
 					return;
 				}
-				done({ kind: "approve", denial, remember });
+				done({ kind: "approve", denial });
 			};
 
-			const startRule = (): void => {
-				const denial = selectedDenial();
-				if (!denial) return;
-				editing = true;
-				editorValue = suggestPattern(denial);
+			const openEditor = (state: EditorState, seed: string): void => {
+				editor = state;
+				input.setValue(seed);
+				// Put the cursor at the end of the seed.
+				input.handleInput("\x05");
 				hint = "";
 				invalidate();
 				tui.requestRender();
 			};
 
-			const commitRule = (): void => {
-				const denial = selectedDenial();
-				if (!denial) {
-					editing = false;
-					return;
-				}
-				const checked = sanitisePattern(denial, editorValue);
-				if (!checked.ok) {
-					denyUnavailable(checked.error);
-					return;
-				}
-				done({ kind: "write-rule", denial, pattern: checked.pattern });
+			const closeEditor = (): void => {
+				editor = undefined;
+				hint = "";
+				invalidate();
+				tui.requestRender();
 			};
 
-			const removeRemembered = (): void => {
-				const row = selectedRemembered();
-				if (!row) return;
-				done({ kind: "delete", entry: row.entry, listKind: row.listKind });
+			const startEditor = (mode: "remember" | "rule"): void => {
+				const denial = selectedDenial();
+				if (!denial) return;
+				if (mode === "remember" && !denial.overridable) {
+					denyUnavailable("an authorizer cannot lift a rule — write one instead (w)");
+					return;
+				}
+				openEditor({ mode, denial }, suggestPattern(denial));
 			};
 
 			const editRemembered = (): void => {
 				const row = selectedRemembered();
 				if (!row) return;
-				// Editing a stored pattern is a delete + write; hand the value back
-				// as a pre-filled rule editor over the denial that produced it.
-				const denial = data.denials.find(
-					(item) => item.surface === row.entry.surface && entryMatches(row.entry, item.surface, item.value),
-				);
-				if (!denial) {
-					denyUnavailable("no recent denial matches this pattern — delete it instead (d)");
+				openEditor({ mode: "edit", row }, row.entry.value);
+			};
+
+			const commitEditor = (value: string): void => {
+				if (!editor) return;
+				if (editor.mode === "edit" && editor.row) {
+					const checked = checkPatternShape(editor.row.entry.surface, value);
+					if (!checked.ok) return denyUnavailable(checked.error);
+					done({ kind: "edit", entry: editor.row.entry, listKind: editor.row.listKind, pattern: checked.pattern });
 					return;
 				}
-				tab = "denied";
-				cursor = Math.max(0, data.denials.indexOf(denial));
-				editing = true;
-				editorValue = row.entry.value;
-				hint = "";
-				invalidate();
-				tui.requestRender();
+				const denial = editor.denial;
+				if (!denial) return closeEditor();
+				const checked = sanitisePattern(denial, value);
+				if (!checked.ok) return denyUnavailable(checked.error);
+				if (editor.mode === "remember") {
+					done({ kind: "remember", denial, pattern: checked.pattern });
+					return;
+				}
+				const warnings = data.ruleConflicts(denial, checked.pattern);
+				if (warnings.length > 0 && editor.confirmed !== checked.pattern) {
+					editor.confirmed = checked.pattern;
+					denyUnavailable(`${warnings.join("; ")} — enter again to write anyway`);
+					return;
+				}
+				done({ kind: "write-rule", denial, pattern: checked.pattern });
+			};
+
+			input.onSubmit = commitEditor;
+			input.onEscape = closeEditor;
+
+			const removeRemembered = (): void => {
+				const row = selectedRemembered();
+				if (!row) return;
+				done({ kind: "delete", entry: row.entry, listKind: row.listKind });
 			};
 
 			const cycleTab = (delta: number): void => {
@@ -363,7 +395,7 @@ export async function openPanel(
 					const entry = selectedRemembered();
 					if (!entry) return [];
 					const values = data.denials.map((denial) => denial.value);
-					const matches = countMatches(entry.entry, values);
+					const matches = countMatches(entry.entry, entry.listKind, values);
 					if (narrow) {
 						return [
 							{ text: `${fg("dim", entry.entry.surface)} · ${entry.listKind}` },
@@ -417,10 +449,16 @@ export async function openPanel(
 			};
 
 			const actions = (): string[] => {
-				if (editing) {
+				if (editor) {
+					const bashPattern =
+						editor.mode !== "rule" &&
+						policyKeyForSurface(editor.denial?.surface ?? editor.row?.entry.surface ?? "") === "bash";
 					return [
-						fg("accent", "enter") + " save   " + fg("accent", "esc") + " cancel",
-						fg("dim", "* matches any characters, including /"),
+						fg("accent", "enter") + " save   " + fg("accent", "esc") + " cancel   " + fg("dim", "ctrl+a/e/u/k/w edit · paste ok"),
+						fg("dim", "* any characters (incl. / and newlines) · ? one character · 'cmd *' also matches bare 'cmd'"),
+						...(bashPattern
+							? [fg("dim", "a remembered pattern only matches single commands — use (w) to cover chains like 'cd x && …'")]
+							: []),
 					];
 				}
 				if (tab === "denied") {
@@ -428,7 +466,7 @@ export async function openPanel(
 					const dimmed = denial && !denial.overridable;
 					const dim = (text: string) => (dimmed ? fg("dim", text) : text);
 					return [
-						`${dim("(a) approve + retry")}   ${dim("(r) remember + retry")}   (w) write rule`,
+						`${dim("(a) approve for session")}   ${dim("(r) remember…")}   (w) write policy rule…`,
 						fg("dim", "↑↓ move · tab switch · ctrl+o expand · esc close"),
 					];
 				}
@@ -468,8 +506,15 @@ export async function openPanel(
 					body.push(row(width, ""), separator(width, "selected"), ...factLines.map((item) => row(width, item.text)));
 				}
 				if (hint) body.push(row(width, ""), separator(width, "hint"), row(width, hint));
-				if (editing) {
-					body.push(row(width, ""), separator(width, "edit pattern"), row(width, `${editorValue}${GLYPH.cursor}`));
+				if (editor) {
+					const label =
+						editor.mode === "rule"
+							? `policy rule → config.json ${policyKeyForSurface(editor.denial?.surface ?? "")}`
+							: editor.mode === "remember"
+								? "remember → approvals.json"
+								: "edit remembered pattern";
+					const [line = ""] = input.render(contentWidth(width));
+					body.push(row(width, ""), separator(width, label), row(width, line));
 				}
 				body.push(row(width, ""), separator(width, ""), ...actions().map((line) => row(width, line)));
 				return body;
@@ -477,7 +522,6 @@ export async function openPanel(
 
 			// ---- input -----------------------------------------------------
 
-			const printable = (data: string): boolean => data.length === 1 && data >= " " && data !== "\x7f";
 
 			return {
 				render(width: number): string[] {
@@ -487,26 +531,14 @@ export async function openPanel(
 					return cachedLines;
 				},
 				handleInput(data: string): void {
-					if (editing) {
-						if (data === "\r" || data === "\n") {
-							commitRule();
-							return;
-						}
-						if (data === "\x1b") {
-							editing = false;
-							hint = "";
-							invalidate();
-							tui.requestRender();
-							return;
-						}
-						if (data === "\x7f" || data === "\b") {
-							editorValue = editorValue.slice(0, -1);
-							invalidate();
-							tui.requestRender();
-							return;
-						}
-						if (printable(data)) {
-							editorValue += data;
+					if (editor) {
+						input.handleInput(data);
+						if (editor) {
+							// Any keystroke after a warning needs a fresh confirmation.
+							if (editor.confirmed !== undefined && editor.confirmed !== input.getValue().trim()) {
+								editor.confirmed = undefined;
+								hint = "";
+							}
 							invalidate();
 							tui.requestRender();
 						}
@@ -540,19 +572,19 @@ export async function openPanel(
 						return;
 					}
 					if (keybindings.matches(data, "tui.select.confirm") || data === "\r" || data === "\n") {
-						if (tab === "denied") approve(false);
+						if (tab === "denied") approve();
 						return;
 					}
 					if (data === "a") {
-						approve(false);
+						approve();
 						return;
 					}
-					if (data === "r") {
-						approve(true);
+					if (data === "r" && tab === "denied") {
+						startEditor("remember");
 						return;
 					}
-					if (data === "w") {
-						startRule();
+					if (data === "w" && tab === "denied") {
+						startEditor("rule");
 						return;
 					}
 					if (data === "d" && tab === "remembered") {

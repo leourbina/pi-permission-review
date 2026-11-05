@@ -37,17 +37,21 @@ Run something the gate refuses, then `/permissions`.
 | --- | --- |
 | `↑` `↓` / `j` `k` | move |
 | `tab` / `⇧tab` | Denied · Remembered · Session |
-| `enter` / `a` | approve + retry, this session only |
-| `r` | remember in `approvals.json` + retry |
-| `w` | write a policy rule, reload, then retry |
+| `enter` / `a` | approve this exact call for the session + retry |
+| `r` | remember a call or pattern in `approvals.json` + retry |
+| `w` | write a policy rule + retry (takes effect immediately) |
 | `d` | delete a remembered approval |
-| `e` | edit a remembered pattern |
+| `e` | edit a remembered approval in place |
 | `ctrl+o` | expand the wrapped command |
 | `esc` | close |
 
 Acting on a row removes it: the Denied tab is a queue of outstanding refusals, not a log. If the retry is refused again, the new denial appears as a fresh row.
 
 Unavailable actions are dimmed rather than hidden: on a `policy` denial, `a` and `r` cannot work, because no chain link can lift a rule.
+
+`r` and `w` open a pattern editor seeded with the narrowest useful pattern — the command's subcommand plus ` *`, e.g. `git worktree remove *` (same depth table as the gate's session approvals). The editor is pi's own single-line input: paste works, and so do the usual emacs keys. Patterns use the gate's syntax: `*` matches anything (including `/` and newlines), `?` one character, and a trailing ` *` also matches the bare command.
+
+**Prefer `w` for bash.** The gate evaluates a policy rule per command unit, so `git worktree remove *` also covers `cd ~/code && git worktree remove x`. A remembered pattern is matched by the review link against the *whole* command string, so it only applies to single plain commands — anything with `&&`, `;`, `|`, redirects or `$(…)` is left to the judge, so a pattern can never ride along on a chained command.
 
 ## How it works
 
@@ -56,9 +60,9 @@ Two mechanisms, because the gate has two kinds of refusal:
 | `resolution` | Surfaces | Undo |
 | --- | --- | --- |
 | `authorizer_denied` | `bash`, `mcp`, `skill`, … | the link named `review-approvals` allows it |
-| `policy_deny`, `user_denied` | `path`, `external_directory`, any rule match | a rule is written to the policy config, then `ctx.reload()` |
+| `policy_deny`, `user_denied` | `path`, `external_directory`, any rule match | a rule is written to the policy config |
 
-A rule write cannot be applied before the reload, and the retry must survive the reload, so the retry is parked in `pending-retry.json` and consumed on the next `session_start`.
+The gate re-reads its config whenever the file's mtime changes, so a written rule applies to the very next call and the retry is sent straight away. The rule is moved to the end of its section, because the gate takes the last matching rule.
 
 Denials are collected from the `permissions:decision` broadcast, not from the review log: the log is shared by every pi session on the machine and carries no session id on denial entries, so it cannot tell whose refusals those are. The broadcast fires on this session's own bus.
 
@@ -70,14 +74,16 @@ Kept in `~/.pi/agent/permission-review/` (respects `PI_CODING_AGENT_DIR`), never
 | --- | --- |
 | `approvals.json` | remembered calls and patterns, with `scope` and `sessionId` |
 | `denials.json` | this session's denial feed, so `/reload` does not empty the panel |
-| `pending-retry.json` | one-shot retry that survives a reload |
 
 Every approval appends `permissions-review.approved` to the gate's own review log, and every use of an approval appends `permissions-review.allowed`, so there is one chronological trail of who allowed what.
 
 ## Guardrails
 
 - never writes `yoloMode`, never broadens the policy to `"*": "allow"`
-- remembered bash patterns are limited to the exact command, or one leading word plus ` *`
+- a bash pattern must start with a literal word and must match the refused command (or one of its units), so `*`, `g*` or an unrelated pattern is refused; `*` may only end a bash pattern, because an inner one spans arguments (`git -C * push *` would also match `git -C . config core.pager <program> push`), and a stored pattern with an inner `*` never matches
+- remembered bash patterns never match chained, piped or redirected commands
+- writing an allow that overlaps an existing `deny` (`sudo apt *` vs `sudo *`) shows a warning and needs a second `enter`
+- a policy config with comments is never rewritten (the comments would be lost); the previous config is kept as `config.json.bak`
 - filesystem rules are only ever the exact path, never a glob
 - an unreadable or corrupt store is treated as empty: no crash, no accidental allow
 
@@ -92,7 +98,7 @@ Every approval appends `permissions-review.approved` to the gate's own review lo
 
 Versions are cut by [release-please](https://github.com/googleapis/release-please). Commit to `main` with [Conventional Commits](https://www.conventionalcommits.org) — `feat:`, `fix:`, `docs:`, `refactor:` — and release-please opens a release PR that bumps `package.json`, rewrites `CHANGELOG.md`, and tags the commit when merged. The tag triggers a publish job that runs `node scripts/check-manifest.mjs` and then `npm publish --provenance`.
 
-CI on every push and PR runs the same manifest check plus `npm pack --dry-run`, which catches a manifest pi would refuse to load before it reaches the registry.
+CI on every push and PR runs the same manifest check, `npm test` (node's built-in runner with type stripping, no dependencies), and `npm pack --dry-run`, which catches a manifest pi would refuse to load before it reaches the registry.
 
 Publishing needs an `NPM_TOKEN` repository secret (an npm automation token). Provenance uses the workflow's `id-token: write` permission, which is already set.
 

@@ -7,11 +7,11 @@
  *
  * The override mechanism is an authorizer chain link. A link can only lift an
  * `authorizer` denial; `policy` denials (and the path / external_directory
- * surfaces) are decided before any link runs, so those go through a rule write
- * followed by a reload.
+ * surfaces) are decided before any link runs, so those go through a rule
+ * write. The gate re-reads its config on the next call, so no reload is needed.
  */
 
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -25,22 +25,25 @@ import {
 	sessionEntries,
 	type Approvals,
 	readApprovals,
+	replaceEntry,
 	SessionApprovals,
 	writeApprovals,
 } from "./approvals.ts";
-import { type Denial, isLinkExcludedSurface, timeLabel } from "./denials.ts";
+import { type Denial, isLinkExcludedSurface } from "./denials.ts";
 import { openPanel, type PanelResult } from "./panel.ts";
-import {
-	retryMessage,
-	takePendingRetry,
-	writePendingRetry,
-	type PendingRetry,
-	writeRule,
-} from "./policy.ts";
+import { retryMessage, ruleConflicts, writeRule } from "./policy.ts";
 
 const LINK_NAME = "review-approvals";
-/** Bumped whenever the panel's rendering changes; logged on load to prove a reload took. */
-const VERSION = "0.9.3";
+
+/** The package version, logged on load to prove a reload took. */
+const VERSION = (() => {
+	try {
+		const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version?: string };
+		return pkg.version ?? "unknown";
+	} catch {
+		return "unknown";
+	}
+})();
 const SERVICES_SYMBOL = Symbol.for("@gotgenes/pi-permission-system:session-services");
 
 type SessionServices = Map<string, { registerAuthorizer(name: string, authorize: unknown): () => void }>;
@@ -275,12 +278,12 @@ export default function permissionReview(pi: ExtensionAPI): void {
 			// session manager unavailable in this host
 		}
 
-		const pending = takePendingRetry(agentDir(), Date.now());
-		if (pending) {
-			setTimeout(() => {
-				const command = ctx as unknown as ExtensionCommandContext;
-				send(command, retryMessage(pending.toolName, pending.value));
-			}, 400);
+		// Versions before 1.1 parked a retry here across a reload; rules now apply
+		// without one, so a leftover file is only noise.
+		try {
+			rmSync(join(paths().state, "pending-retry.json"), { force: true });
+		} catch {
+			// nothing to clean
 		}
 	});
 	pi.on("session_shutdown", () => {
@@ -356,45 +359,44 @@ export default function permissionReview(pi: ExtensionAPI): void {
 				},
 				session,
 				judge: judgeLabel(),
+				ruleConflicts: (denial, pattern) => ruleConflicts(paths().policyConfig, denial, pattern),
 			});
 			if (!result) return;
 
 			if (result.kind === "approve") {
-				const { denial, remember } = result;
+				const { denial } = result;
 				session.add(denial.surface, denial.value);
-				let next = addEntry(
-					approvals,
-					"exact",
-					denial.surface,
-					denial.value,
-					remember ? { scope: "always" } : { scope: "session", sessionId: sessionId ?? "" },
+				writeApprovals(
+					paths().approvals,
+					addEntry(approvals, "exact", denial.surface, denial.value, { scope: "session", sessionId: sessionId ?? "" }),
 				);
-				// A remembered decision should also cover the pattern the gate matched,
-				// when that pattern is narrower than the whole tool.
-				const suggested = denial.matchedPattern;
-				if (suggested && suggested !== "*" && suggested !== denial.value) {
-					next = addEntry(
-						next,
-						"pattern",
-						denial.surface,
-						suggested,
-						remember ? { scope: "always" } : { scope: "session", sessionId: sessionId ?? "" },
-					);
-				}
-				writeApprovals(paths().approvals, next);
 				dropFromFeed(denial);
 				audit({
 					event: "permissions-review.approved",
-					scope: remember ? "remembered" : "session",
+					scope: "session",
 					surface: denial.surface,
 					value: denial.value,
-					rule: denial.matchedPattern,
 					requestId: denial.requestId,
 				});
-				ctx.ui.notify(
-					`${remember ? "Remembered" : "Approved"} · retrying ${denial.value.slice(0, 60)}`,
-					"info",
-				);
+				ctx.ui.notify(`Approved for this session · retrying ${denial.value.slice(0, 60)}`, "info");
+				send(ctx, retryMessage(denial.toolName, denial.value));
+				return;
+			}
+
+			if (result.kind === "remember") {
+				const { denial, pattern } = result;
+				const kind = pattern === denial.value ? "exact" : "pattern";
+				writeApprovals(paths().approvals, addEntry(approvals, kind, denial.surface, pattern, { scope: "always" }));
+				dropFromFeed(denial);
+				audit({
+					event: "permissions-review.approved",
+					scope: "remembered",
+					surface: denial.surface,
+					value: denial.value,
+					pattern,
+					requestId: denial.requestId,
+				});
+				ctx.ui.notify(`Remembered ${pattern.slice(0, 60)} · retrying`, "info");
 				send(ctx, retryMessage(denial.toolName, denial.value));
 				return;
 			}
@@ -406,21 +408,25 @@ export default function permissionReview(pi: ExtensionAPI): void {
 				return;
 			}
 
-			// write-rule: a policy denial the link cannot lift.
+			if (result.kind === "edit") {
+				const next = replaceEntry(approvals, result.listKind, result.entry, result.pattern);
+				writeApprovals(paths().approvals, next);
+				audit({
+					event: "permissions-review.edited",
+					surface: result.entry.surface,
+					from: result.entry.value,
+					to: result.pattern,
+				});
+				ctx.ui.notify(`Updated ${result.entry.value.slice(0, 40)} → ${result.pattern.slice(0, 40)}`, "info");
+				return;
+			}
+
+			// write-rule: takes effect on the next gate call, no reload needed.
 			const written = writeRule(paths().policyConfig, result.denial, result.pattern);
 			if (!written.ok) {
 				ctx.ui.notify(`Could not write rule: ${written.error}`, "error");
 				return;
 			}
-			const retry: PendingRetry = {
-				value: result.denial.value,
-				toolName: result.denial.toolName,
-				surface: result.denial.surface,
-				at: Date.now(),
-			};
-			writePendingRetry(agentDir(), retry);
-			// Persisted before the reload, so the panel does not re-list a request
-			// whose rule has just been written.
 			dropFromFeed(result.denial);
 			audit({
 				event: "permissions-review.rule-written",
@@ -429,11 +435,8 @@ export default function permissionReview(pi: ExtensionAPI): void {
 				pattern: written.pattern,
 				requestId: result.denial.requestId,
 			});
-			ctx.ui.notify(
-				`Rule written (${written.key}: ${written.pattern}) · reloading, then retrying`,
-				"info",
-			);
-			await ctx.reload();
+			ctx.ui.notify(`Rule written (${written.key}: ${written.pattern}) · retrying`, "info");
+			send(ctx, retryMessage(result.denial.toolName, result.denial.value));
 		},
 	});
 }

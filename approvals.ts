@@ -6,12 +6,17 @@
  *  - the session set, held in memory and cleared on `session_shutdown`
  *  - the persisted store in `approvals.json`, read fresh per ask
  *
- * The matcher mirrors pi-permission-system's own wildcard semantics: `*`
- * matches zero or more of any character, including path separators.
+ * Which list an entry lives in decides how it matches: `exact` entries compare
+ * verbatim (a command with `?` in a URL is not a pattern), `patterns` use the
+ * gate's own wildcard semantics (see pattern.ts).
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+
+import { checkBashShape, isSimpleCommand, wildcardMatch } from "./pattern.ts";
+
+export { wildcardToRegExp } from "./pattern.ts";
 
 export type ApprovalEntry = {
 	/** Gate surface the approval applies to: "bash", "read", "path", … */
@@ -72,31 +77,24 @@ export function writeApprovals(path: string, approvals: Approvals): void {
 	renameSync(tmp, path);
 }
 
-export function removeApprovalsFile(path: string): void {
-	try {
-		rmSync(path);
-	} catch {
-		// already gone
-	}
-}
-
-/** `git *` -> /^git .*$/ ; every other regex metacharacter is literal. */
-export function wildcardToRegExp(pattern: string): RegExp {
-	const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-	return new RegExp(`^${escaped}$`);
-}
-
-export function entryMatches(entry: ApprovalEntry, surface: string, value: string): boolean {
+export function entryMatches(entry: ApprovalEntry, kind: ApprovalKind, surface: string, value: string): boolean {
 	if (entry.surface !== surface) return false;
-	return entry.value.includes("*") ? wildcardToRegExp(entry.value).test(value) : entry.value === value;
+	if (kind === "exact") return entry.value === value;
+	// The link sees the whole bash string; a pattern must not ride along on a
+	// chained, piped or redirected command. Those defer to the judge instead.
+	if (surface === "bash" && !isSimpleCommand(value)) return false;
+	// A hand-edited or pre-1.1 entry may have a shape the editor now refuses
+	// (an inner `*` spans arguments); it never matches.
+	if (surface === "bash" && checkBashShape(entry.value) !== null) return false;
+	return wildcardMatch(entry.value, value);
 }
 
 export function matches(approvals: Approvals, surface: string, value: string, sessionId?: string): boolean {
 	const applies = (entry: ApprovalEntry): boolean =>
 		entry.scope !== "session" || (sessionId !== undefined && entry.sessionId === sessionId);
 	return (
-		approvals.exact.some((entry) => applies(entry) && entryMatches(entry, surface, value)) ||
-		approvals.patterns.some((entry) => applies(entry) && entryMatches(entry, surface, value))
+		approvals.exact.some((entry) => applies(entry) && entryMatches(entry, "exact", surface, value)) ||
+		approvals.patterns.some((entry) => applies(entry) && entryMatches(entry, "pattern", surface, value))
 	);
 }
 
@@ -152,8 +150,26 @@ export function deleteEntry(approvals: Approvals, kind: ApprovalKind, surface: s
  * How many of the given values an entry covers. Used by the Remembered tab so
  * an over-broad pattern is visible before it bites.
  */
-export function countMatches(entry: ApprovalEntry, values: string[]): number {
-	return values.filter((value) => entryMatches(entry, entry.surface, value)).length;
+export function countMatches(entry: ApprovalEntry, kind: ApprovalKind, values: string[]): number {
+	return values.filter((value) => entryMatches(entry, kind, entry.surface, value)).length;
+}
+
+/**
+ * Replace a stored entry with a new value, keeping its scope and session. The
+ * new value lands in `patterns` when it holds a wildcard, else in `exact`.
+ */
+export function replaceEntry(
+	approvals: Approvals,
+	kind: ApprovalKind,
+	entry: ApprovalEntry,
+	value: string,
+): Approvals {
+	const without = deleteEntry(approvals, kind, entry.surface, entry.value);
+	const nextKind: ApprovalKind = value.includes("*") || value.includes("?") ? "pattern" : "exact";
+	return addEntry(without, nextKind, entry.surface, value, {
+		...(entry.scope ? { scope: entry.scope } : {}),
+		...(entry.sessionId ? { sessionId: entry.sessionId } : {}),
+	});
 }
 
 /** Session-scoped approvals: exact (surface, value) pairs. */
