@@ -1,3 +1,12 @@
+# Changelog
+
+## [1.0.1](https://github.com/leourbina/pi-permission-review/compare/v1.0.0...v1.0.1) (2026-11-05)
+
+
+### Bug Fixes
+
+* keep the review link registered after a reload ([5915b26](https://github.com/leourbina/pi-permission-review/commit/5915b26dad256e95aea6fe76f34b24fc73fe9fd4))
+
 ## 1.0.0
 
 First public release. The 0.9.x versions were local iterations and were never
