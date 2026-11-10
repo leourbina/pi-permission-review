@@ -31,7 +31,8 @@ import {
 } from "./approvals.ts";
 import { type Denial, isLinkExcludedSurface } from "./denials.ts";
 import { openPanel, type PanelResult } from "./panel.ts";
-import { retryMessage, ruleConflicts, writeRule } from "./policy.ts";
+import { retryAllMessage } from "./marks.ts";
+import { ruleConflicts, writeRule } from "./policy.ts";
 
 const LINK_NAME = "review-approvals";
 
@@ -340,7 +341,7 @@ export default function permissionReview(pi: ExtensionAPI): void {
 			}
 			if (args.trim() === "help") {
 				ctx.ui.notify(
-					"/permissions — review denials. Keys: a approve, r remember, w write rule, d delete, e edit, ctrl+o expand, tab switch.",
+					"/permissions — review denials. Keys: enter mark approve, r mark retry, esc apply marks, m remember, w write rule, d delete, e edit, ctrl+o expand, tab switch.",
 					"info",
 				);
 				return;
@@ -349,7 +350,7 @@ export default function permissionReview(pi: ExtensionAPI): void {
 			const denials: Denial[] = feed;
 			const approvals: Approvals = readApprovals(paths().approvals);
 
-			const result: PanelResult = await openPanel(ctx, {
+			const result: PanelResult | undefined = await openPanel(ctx, {
 				denials,
 				// Remembered tab: durable entries only. Session-scoped approvals live
 				// in their own tab, sourced from the in-memory set.
@@ -358,18 +359,19 @@ export default function permissionReview(pi: ExtensionAPI): void {
 					patterns: approvals.patterns.filter((entry) => entry.scope !== "session"),
 				},
 				session,
+				midTurn: !ctx.isIdle(),
 				judge: judgeLabel(),
 				ruleConflicts: (denial, pattern) => ruleConflicts(paths().policyConfig, denial, pattern),
 			});
 			if (!result) return;
 
-			if (result.kind === "approve") {
-				const { denial } = result;
+			let store = approvals;
+			const retry: Denial[] = [...result.retry];
+
+			// Every marked row is approved for this session; retry is a subset.
+			for (const denial of result.approved) {
 				session.add(denial.surface, denial.value);
-				writeApprovals(
-					paths().approvals,
-					addEntry(approvals, "exact", denial.surface, denial.value, { scope: "session", sessionId: sessionId ?? "" }),
-				);
+				store = addEntry(store, "exact", denial.surface, denial.value, { scope: "session", sessionId: sessionId ?? "" });
 				dropFromFeed(denial);
 				audit({
 					event: "permissions-review.approved",
@@ -377,16 +379,15 @@ export default function permissionReview(pi: ExtensionAPI): void {
 					surface: denial.surface,
 					value: denial.value,
 					requestId: denial.requestId,
+					retry: result.retry.includes(denial),
 				});
-				ctx.ui.notify(`Approved for this session · retrying ${denial.value.slice(0, 60)}`, "info");
-				send(ctx, retryMessage(denial.toolName, denial.value));
-				return;
 			}
 
-			if (result.kind === "remember") {
-				const { denial, pattern } = result;
+			const action = result.action;
+			if (action?.kind === "remember") {
+				const { denial, pattern } = action;
 				const kind = pattern === denial.value ? "exact" : "pattern";
-				writeApprovals(paths().approvals, addEntry(approvals, kind, denial.surface, pattern, { scope: "always" }));
+				store = addEntry(store, kind, denial.surface, pattern, { scope: "always" });
 				dropFromFeed(denial);
 				audit({
 					event: "permissions-review.approved",
@@ -396,47 +397,53 @@ export default function permissionReview(pi: ExtensionAPI): void {
 					pattern,
 					requestId: denial.requestId,
 				});
-				ctx.ui.notify(`Remembered ${pattern.slice(0, 60)} · retrying`, "info");
-				send(ctx, retryMessage(denial.toolName, denial.value));
-				return;
-			}
-
-			if (result.kind === "delete") {
-				const next = deleteEntry(approvals, result.listKind, result.entry.surface, result.entry.value);
-				writeApprovals(paths().approvals, next);
-				ctx.ui.notify(`Removed approval ${result.entry.value.slice(0, 60)}`, "info");
-				return;
-			}
-
-			if (result.kind === "edit") {
-				const next = replaceEntry(approvals, result.listKind, result.entry, result.pattern);
-				writeApprovals(paths().approvals, next);
+				ctx.ui.notify(`Remembered ${pattern.slice(0, 60)}`, "info");
+				if (!action.fromSession) retry.push(denial);
+			} else if (action?.kind === "delete") {
+				store = deleteEntry(store, action.listKind, action.entry.surface, action.entry.value);
+				ctx.ui.notify(`Removed approval ${action.entry.value.slice(0, 60)}`, "info");
+			} else if (action?.kind === "edit") {
+				store = replaceEntry(store, action.listKind, action.entry, action.pattern);
 				audit({
 					event: "permissions-review.edited",
-					surface: result.entry.surface,
-					from: result.entry.value,
-					to: result.pattern,
+					surface: action.entry.surface,
+					from: action.entry.value,
+					to: action.pattern,
 				});
-				ctx.ui.notify(`Updated ${result.entry.value.slice(0, 40)} → ${result.pattern.slice(0, 40)}`, "info");
-				return;
+				ctx.ui.notify(`Updated ${action.entry.value.slice(0, 40)} → ${action.pattern.slice(0, 40)}`, "info");
+			} else if (action?.kind === "write-rule") {
+				// Takes effect on the next gate call, no reload needed.
+				const written = writeRule(paths().policyConfig, action.denial, action.pattern);
+				if (written.ok) {
+					dropFromFeed(action.denial);
+					audit({
+						event: "permissions-review.rule-written",
+						surface: action.denial.surface,
+						key: written.key,
+						pattern: written.pattern,
+						requestId: action.denial.requestId,
+					});
+					ctx.ui.notify(`Rule written (${written.key}: ${written.pattern})`, "info");
+					if (!action.fromSession) retry.push(action.denial);
+				} else {
+					ctx.ui.notify(`Could not write rule: ${written.error}`, "error");
+				}
 			}
 
-			// write-rule: takes effect on the next gate call, no reload needed.
-			const written = writeRule(paths().policyConfig, result.denial, result.pattern);
-			if (!written.ok) {
-				ctx.ui.notify(`Could not write rule: ${written.error}`, "error");
-				return;
+			if (store !== approvals) writeApprovals(paths().approvals, store);
+
+			const unique = retry.filter(
+				(denial, index) =>
+					retry.findIndex((other) => other.surface === denial.surface && other.value === denial.value) === index,
+			);
+			const approvedOnly = result.approved.length - result.retry.length;
+			if (approvedOnly > 0) {
+				ctx.ui.notify(`Approved ${approvedOnly} blocked ${approvedOnly === 1 ? "call" : "calls"} for this session`, "info");
 			}
-			dropFromFeed(result.denial);
-			audit({
-				event: "permissions-review.rule-written",
-				surface: result.denial.surface,
-				key: written.key,
-				pattern: written.pattern,
-				requestId: result.denial.requestId,
-			});
-			ctx.ui.notify(`Rule written (${written.key}: ${written.pattern}) · retrying`, "info");
-			send(ctx, retryMessage(result.denial.toolName, result.denial.value));
+			if (unique.length > 0) {
+				ctx.ui.notify(`Retrying ${unique.length} ${unique.length === 1 ? "call" : "calls"}`, "info");
+				send(ctx, retryAllMessage(unique));
+			}
 		},
 	});
 }

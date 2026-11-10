@@ -37,19 +37,22 @@ Run something the gate refuses, then `/permissions`.
 | --- | --- |
 | `↑` `↓` / `j` `k` | move |
 | `tab` / `⇧tab` | Denied · Remembered · Session |
-| `enter` / `a` | approve this exact call for the session + retry |
-| `r` | remember a call or pattern in `approvals.json` + retry |
-| `w` | write a policy rule + retry (takes effect immediately) |
+| `enter` / `a` | mark or unmark the call as approved for this session |
+| `r` | mark or unmark the call for retry (a retry is also approved) |
+| `esc` | close, applying every mark: approve the marked calls, then ask the agent to retry the `(retry)` ones in one message |
+| `m` | remember a call or pattern in `approvals.json` + retry; on the Session tab, make a session approval lasting (no retry) |
+| `w` | write a policy rule + retry (takes effect immediately); on the Session tab, turn a session approval into a rule (no retry) |
 | `d` | delete a remembered approval |
 | `e` | edit a remembered approval in place |
 | `ctrl+o` | expand the wrapped command |
-| `esc` | close |
+
+Marking works like Claude Code's `/permissions` → Recently blocked: mark as many rows as you like, and nothing happens until `esc`. Each row shows `✔` once approved and `(approved)` or `(retry)` after the command, and the footer says what `esc` will do (`esc will retry 2 blocked calls`). If the agent is mid-turn, the retry is delivered after the turn. Closing through `m`, `w`, `d` or `e` applies the marks too, and the retries go out together.
 
 Acting on a row removes it: the Denied tab is a queue of outstanding refusals, not a log. If the retry is refused again, the new denial appears as a fresh row.
 
-Unavailable actions are dimmed rather than hidden: on a `policy` denial, `a` and `r` cannot work, because no chain link can lift a rule.
+Unavailable actions are dimmed rather than hidden: a `policy` denial is shown as `(can't be approved)` and takes no mark, because no chain link can lift a rule — use `w`.
 
-`r` and `w` open a pattern editor seeded with the narrowest useful pattern — the command's subcommand plus ` *`, e.g. `git worktree remove *` (same depth table as the gate's session approvals). The editor is pi's own single-line input: paste works, and so do the usual emacs keys. Patterns use the gate's syntax: `*` matches anything (including `/` and newlines), `?` one character, and a trailing ` *` also matches the bare command.
+`m` and `w` open a pattern editor seeded with the narrowest useful pattern — the command's subcommand plus ` *`, e.g. `git worktree remove *` (same depth table as the gate's session approvals). The editor is pi's own single-line input: paste works, and so do the usual emacs keys. Patterns use the gate's syntax: `*` matches anything (including `/` and newlines), `?` one character, and a trailing ` *` also matches the bare command.
 
 **Prefer `w` for bash.** The gate evaluates a policy rule per command unit, so `git worktree remove *` also covers `cd ~/code && git worktree remove x`. A remembered pattern is matched by the review link against the *whole* command string, so it only applies to single plain commands — anything with `&&`, `;`, `|`, redirects or `$(…)` is left to the judge, so a pattern can never ride along on a chained command.
 

@@ -26,6 +26,7 @@
     "denials.ts",
     "panel.ts",
     "pattern.ts",
+    "marks.ts",
     "policy.ts",
     "README.md",
     "CHANGELOG.md",

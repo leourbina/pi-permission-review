@@ -18,18 +18,35 @@ import {
 	SessionApprovals,
 } from "./approvals.ts";
 import { type Denial, timeLabel } from "./denials.ts";
+import {
+	commitPlan,
+	emptyMarks,
+	footerLine,
+	type Marks,
+	markSuffix,
+	toggleApprove,
+	toggleRetry,
+} from "./marks.ts";
 import { checkPatternShape, policyKeyForSurface, sanitisePattern, suggestPattern } from "./policy.ts";
 
-export type PanelResult =
-	/** Approve this exact call for the rest of the session. */
-	| { kind: "approve"; denial: Denial }
+export type PanelAction =
 	/** Remember an exact call or a pattern in approvals.json. */
-	| { kind: "remember"; denial: Denial; pattern: string }
+	| { kind: "remember"; denial: Denial; pattern: string; fromSession?: boolean }
 	/** Write an allow rule into the policy config. */
-	| { kind: "write-rule"; denial: Denial; pattern: string }
+	| { kind: "write-rule"; denial: Denial; pattern: string; fromSession?: boolean }
 	| { kind: "edit"; entry: ApprovalEntry; listKind: ApprovalKind; pattern: string }
-	| { kind: "delete"; entry: ApprovalEntry; listKind: ApprovalKind }
-	| undefined;
+	| { kind: "delete"; entry: ApprovalEntry; listKind: ApprovalKind };
+
+/**
+ * What the panel closed with: the marked rows (approve for the session; retry
+ * is a subset of approved) and at most one editor action. Every way out of the
+ * panel carries the marks, so writing a rule never drops them.
+ */
+export type PanelResult = {
+	action?: PanelAction;
+	approved: Denial[];
+	retry: Denial[];
+};
 
 export type PanelData = {
 	denials: Denial[];
@@ -37,6 +54,8 @@ export type PanelData = {
 	session: SessionApprovals;
 	/** Short description of the active reviewer, shown top-right. */
 	judge: string;
+	/** The agent is mid-turn: a retry is delivered after the turn, not now. */
+	midTurn: boolean;
 	/** Warnings to confirm before a policy rule is written (deny overlaps, …). */
 	ruleConflicts: (denial: Denial, pattern: string) => string[];
 };
@@ -46,6 +65,8 @@ type EditorMode = "remember" | "rule" | "edit";
 type EditorState = {
 	mode: EditorMode;
 	denial?: Denial;
+	/** Promoting a session approval to a lasting rule: the call already ran, so no retry. */
+	fromSession?: boolean;
 	row?: RememberedRow;
 	/** The pattern whose warnings were already shown; a second enter writes it. */
 	confirmed?: string;
@@ -79,6 +100,8 @@ const GLYPH = {
 	marker: "▶",
 	active: "⟦",
 	activeEnd: "⟧",
+	approved: "✔",
+	blocked: "✗",
 };
 
 function plainTruncate(text: string, width: number): string {
@@ -94,13 +117,14 @@ function padTo(text: string, target: number): string {
 export async function openPanel(
 	ctx: ExtensionCommandContext,
 	data: PanelData,
-): Promise<PanelResult> {
-	return ctx.ui.custom<PanelResult>(
+): Promise<PanelResult | undefined> {
+	return ctx.ui.custom<PanelResult | undefined>(
 		(tui, theme, keybindings, done) => {
 			let tab: Tab = "denied";
 			let cursor = 0;
 			let expanded = false;
 			let editor: EditorState | undefined;
+			let marks: Marks = emptyMarks();
 			const input = new Input({ prompt: "" });
 			input.focused = true;
 			let hint = "";
@@ -165,14 +189,28 @@ export async function openPanel(
 				tui.requestRender();
 			};
 
-			const approve = (): void => {
+			/** Close the panel, applying every mark plus at most one action. */
+			const finish = (action?: PanelAction): void => {
+				const plan = commitPlan(marks, data.denials);
+				if (!action && plan.approved.length === 0) {
+					done(undefined);
+					return;
+				}
+				done({ action, ...plan });
+			};
+
+			/** Enter toggles approve; r toggles retry. Policy denials take no mark. */
+			const mark = (toggle: typeof toggleApprove): void => {
 				const denial = selectedDenial();
 				if (!denial) return;
 				if (!denial.overridable) {
 					denyUnavailable("an authorizer cannot lift a rule — write one instead (w)");
 					return;
 				}
-				done({ kind: "approve", denial });
+				marks = toggle(marks, data.denials, cursor);
+				hint = "";
+				invalidate();
+				tui.requestRender();
 			};
 
 			const openEditor = (state: EditorState, seed: string): void => {
@@ -192,9 +230,33 @@ export async function openPanel(
 				tui.requestRender();
 			};
 
+			/** A session approval as the call it came from, so the editor can promote it. */
+			const selectedSessionCall = (): Denial | undefined => {
+				if (tab !== "session") return undefined;
+				const entry = sessionRows()[cursor];
+				if (!entry) return undefined;
+				return {
+					requestId: "",
+					ts: 0,
+					surface: entry.surface,
+					toolName: entry.surface,
+					value: entry.value,
+					matchedPattern: null,
+					decidedByKind: "authorizer",
+					decidedByName: null,
+					reason: "approved for this session",
+					overridable: true,
+				};
+			};
+
 			const startEditor = (mode: "remember" | "rule"): void => {
-				const denial = selectedDenial();
+				const sessionCall = selectedSessionCall();
+				const denial = sessionCall ?? selectedDenial();
 				if (!denial) return;
+				if (sessionCall) {
+					openEditor({ mode, denial, fromSession: true }, suggestPattern(denial));
+					return;
+				}
 				if (mode === "remember" && !denial.overridable) {
 					denyUnavailable("an authorizer cannot lift a rule — write one instead (w)");
 					return;
@@ -213,7 +275,7 @@ export async function openPanel(
 				if (editor.mode === "edit" && editor.row) {
 					const checked = checkPatternShape(editor.row.entry.surface, value);
 					if (!checked.ok) return denyUnavailable(checked.error);
-					done({ kind: "edit", entry: editor.row.entry, listKind: editor.row.listKind, pattern: checked.pattern });
+					finish({ kind: "edit", entry: editor.row.entry, listKind: editor.row.listKind, pattern: checked.pattern });
 					return;
 				}
 				const denial = editor.denial;
@@ -221,7 +283,7 @@ export async function openPanel(
 				const checked = sanitisePattern(denial, value);
 				if (!checked.ok) return denyUnavailable(checked.error);
 				if (editor.mode === "remember") {
-					done({ kind: "remember", denial, pattern: checked.pattern });
+					finish({ kind: "remember", denial, pattern: checked.pattern, fromSession: editor.fromSession });
 					return;
 				}
 				const warnings = data.ruleConflicts(denial, checked.pattern);
@@ -230,7 +292,7 @@ export async function openPanel(
 					denyUnavailable(`${warnings.join("; ")} — enter again to write anyway`);
 					return;
 				}
-				done({ kind: "write-rule", denial, pattern: checked.pattern });
+				finish({ kind: "write-rule", denial, pattern: checked.pattern, fromSession: editor.fromSession });
 			};
 
 			input.onSubmit = commitEditor;
@@ -239,7 +301,7 @@ export async function openPanel(
 			const removeRemembered = (): void => {
 				const row = selectedRemembered();
 				if (!row) return;
-				done({ kind: "delete", entry: row.entry, listKind: row.listKind });
+				finish({ kind: "delete", entry: row.entry, listKind: row.listKind });
 			};
 
 			const cycleTab = (delta: number): void => {
@@ -347,9 +409,10 @@ export async function openPanel(
 				return data.denials.map((denial, index) => {
 					const selected = index === cursor;
 					const marker = selected ? GLYPH.marker : " ";
-					const badge = denial.overridable ? "" : fg("warning", "!");
+					const status = marks.approved.has(index) ? fg("success", GLYPH.approved) : fg("error", GLYPH.blocked);
 					const value = denial.value.replaceAll("\n", " ⏎ ");
-					return listRow(width, `${marker} ${value}${badge}`, fg("dim", timeLabel(denial.ts)), selected);
+					const suffix = fg("dim", markSuffix(marks, data.denials, index));
+					return listRow(width, `${marker} ${status} ${value}${suffix}`, fg("dim", timeLabel(denial.ts)), selected);
 				});
 			};
 
@@ -358,7 +421,7 @@ export async function openPanel(
 				if (rows.length === 0) {
 					return [
 						{ text: "Nothing remembered yet." },
-						{ text: "Approve with (r) to keep a decision across sessions." },
+						{ text: "Remember with (m) to keep a decision across sessions." },
 						{ text: "" },
 					];
 				}
@@ -461,22 +524,29 @@ export async function openPanel(
 							: []),
 					];
 				}
+				const pending = footerLine(marks, data.midTurn);
+				const close = pending ? fg("accent", pending) : fg("dim", "esc close");
 				if (tab === "denied") {
 					const denial = selectedDenial();
 					const dimmed = denial && !denial.overridable;
 					const dim = (text: string) => (dimmed ? fg("dim", text) : text);
 					return [
-						`${dim("(a) approve for session")}   ${dim("(r) remember…")}   (w) write policy rule…`,
-						fg("dim", "↑↓ move · tab switch · ctrl+o expand · esc close"),
+						`${dim("(enter) approve")}   ${dim("(r) retry")}   ${dim("(m) remember…")}   (w) write policy rule…`,
+						`${fg("dim", "↑↓ move · tab switch · ctrl+o expand · ")}${close}`,
 					];
 				}
 				if (tab === "remembered") {
 					return [
 						"(d) delete   (e) edit pattern",
-						fg("dim", "↑↓ move · tab switch · esc close"),
+						`${fg("dim", "↑↓ move · tab switch · ")}${close}`,
 					];
 				}
-				return ["", fg("dim", "↑↓ move · tab switch · esc close")];
+				const hasSession = sessionRows().length > 0;
+				const dim = (text: string) => (hasSession ? text : fg("dim", text));
+				return [
+					`${dim("(m) remember…")}   ${dim("(w) write policy rule…")}`,
+					`${fg("dim", "↑↓ move · tab switch · ")}${close}`,
+				];
 			};
 
 			/** Keep the list to MAX_ROWS, scrolling around the cursor. */
@@ -546,7 +616,7 @@ export async function openPanel(
 					}
 
 					if (data === "\x1b") {
-						done(undefined);
+						finish();
 						return;
 					}
 					if (data === "\t") {
@@ -571,19 +641,19 @@ export async function openPanel(
 						move(1);
 						return;
 					}
-					if (keybindings.matches(data, "tui.select.confirm") || data === "\r" || data === "\n") {
-						if (tab === "denied") approve();
-						return;
-					}
-					if (data === "a") {
-						approve();
+					if (keybindings.matches(data, "tui.select.confirm") || data === "\r" || data === "\n" || data === "a") {
+						if (tab === "denied") mark(toggleApprove);
 						return;
 					}
 					if (data === "r" && tab === "denied") {
+						mark(toggleRetry);
+						return;
+					}
+					if (data === "m" && (tab === "denied" || tab === "session")) {
 						startEditor("remember");
 						return;
 					}
-					if (data === "w" && tab === "denied") {
+					if (data === "w" && (tab === "denied" || tab === "session")) {
 						startEditor("rule");
 						return;
 					}
